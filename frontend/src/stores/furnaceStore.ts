@@ -230,16 +230,28 @@ export const useFurnaceStore = defineStore('furnace', () => {
     revision.value += 1
   }
 
-  /** 取料：按剩余量扣减，返回实际扣减量 */
+  /** 最近一次取料触发的作废重排统计 */
+  const lastRerank = ref<{ colorCode: string; summary: { placed: number; held: number; queued: number; total: number } } | null>(null)
+
+  /**
+   * 取料（改某批领用公斤数）：按剩余量扣减。
+   * 用到这批还没进窑的排位自动作废重排（窑务找回空位），已进窑的不动。
+   */
   async function consume(batchId: string, kg: number): Promise<number> {
-    const actual = await consumeBatch(batchId, kg)
+    const { actual, rerank } = await consumeBatch(batchId, kg)
     revision.value += 1
     const batch = batches.value.find((row) => row.id === batchId)
     if (batch !== undefined) {
       const remain = Math.round((batch.remainKg - actual) * 10) / 10
-      lastMessage.value = isLowRemain(remain)
-        ? `已取料 ${actual} kg，${batch.colorCode} 剩余 ${remain} kg，低于 ${LOW_REMAIN_KG} kg，请及时补料`
-        : `已取料 ${actual} kg，${batch.colorCode} 剩余 ${remain} kg`
+      lastRerank.value = { colorCode: batch.colorCode, summary: rerank }
+      const rerankText =
+        rerank.total === 0
+          ? ''
+          : `；用到 ${batch.colorCode} 未进窑的 ${rerank.total} 个排位已作废重排：重新落位 ${rerank.placed}、挂起 ${rerank.held}、撤回待排 ${rerank.queued}`
+      lastMessage.value =
+        (isLowRemain(remain)
+          ? `已取料 ${actual} kg，${batch.colorCode} 剩余 ${remain} kg，低于 ${LOW_REMAIN_KG} kg，请及时补料`
+          : `已取料 ${actual} kg，${batch.colorCode} 剩余 ${remain} kg`) + rerankText
     }
     return actual
   }
@@ -267,6 +279,7 @@ export const useFurnaceStore = defineStore('furnace', () => {
     counts,
     filters,
     lastMessage,
+    lastRerank,
     revision,
     meltingFurnaces,
     annealingFurnaces,

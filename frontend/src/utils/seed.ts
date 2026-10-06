@@ -82,12 +82,15 @@ export async function seedDatabase(): Promise<void> {
     wrap<Step>({ id: 'step-c3', pieceId: SEED_IDS.pieceCup, seq: 3, name: '塑形', tempC: 1000, durationMin: 8, operator: '林曦', remark: '接杯柄并回火', state: '已完成' }),
   ]
 
-  // ---------------- 退火（4 条，窑位互不冲突；含已出炉 / 退火中 / 待入窑） ----------------
+  // ---------------- 退火（5 条，窑位互不冲突；含已出炉 / 退火中 / 待入窑 / 挂起） ----------------
+  // 排位前按批次对账：batchId 为排位认领用的批次，drawKg 为领用公斤数。
+  // anneal-p1 故意领用 50 kg 超过 A-207 余量 42 kg → 挂起，不占窑位。
   const anneals: Anneal[] = [
-    wrap<Anneal>({ id: 'anneal-g1', pieceId: SEED_IDS.pieceGreen, kilnSlot: 'AN-01-A1', curveSeg: '缓冷', inAt: '2026-09-20T09:00', outAt: '2026-09-21T09:00', state: '已出炉' }),
-    wrap<Anneal>({ id: 'anneal-b1', pieceId: SEED_IDS.pieceBottle, kilnSlot: 'AN-01-A2', curveSeg: '缓冷', inAt: '2026-09-26T08:00', outAt: '2026-09-27T08:00', state: '已出炉' }),
-    wrap<Anneal>({ id: 'anneal-c1', pieceId: SEED_IDS.pieceCup, kilnSlot: 'AN-01-A3', curveSeg: '升温', inAt: '2026-09-29T14:00', outAt: '', state: '退火中' }),
-    wrap<Anneal>({ id: 'anneal-m1', pieceId: SEED_IDS.pieceMorning, kilnSlot: 'AN-01-B1', curveSeg: '保温', inAt: '2026-10-02T10:00', outAt: '', state: '待入窑' }),
+    wrap<Anneal>({ id: 'anneal-g1', pieceId: SEED_IDS.pieceGreen, batchId: SEED_IDS.batchCopper, drawKg: 9.5, kilnSlot: 'AN-01-A1', curveSeg: '缓冷', inAt: '2026-09-20T09:00', outAt: '2026-09-21T09:00', state: '已出炉', holdReason: '' }),
+    wrap<Anneal>({ id: 'anneal-b1', pieceId: SEED_IDS.pieceBottle, batchId: SEED_IDS.batchClear, drawKg: 7.8, kilnSlot: 'AN-01-A2', curveSeg: '缓冷', inAt: '2026-09-26T08:00', outAt: '2026-09-27T08:00', state: '已出炉', holdReason: '' }),
+    wrap<Anneal>({ id: 'anneal-c1', pieceId: SEED_IDS.pieceCup, batchId: SEED_IDS.batchAmber, drawKg: 2.4, kilnSlot: 'AN-01-A3', curveSeg: '升温', inAt: '2026-09-29T14:00', outAt: '', state: '退火中', holdReason: '' }),
+    wrap<Anneal>({ id: 'anneal-m1', pieceId: SEED_IDS.pieceMorning, batchId: SEED_IDS.batchAmber, drawKg: 6.2, kilnSlot: 'AN-01-B1', curveSeg: '保温', inAt: '2026-10-02T10:00', outAt: '', state: '待入窑', holdReason: '' }),
+    wrap<Anneal>({ id: 'anneal-p1', pieceId: SEED_IDS.piecePaperweight, batchId: SEED_IDS.batchIron, drawKg: 50, kilnSlot: 'AN-01-B2', curveSeg: '缓冷', inAt: '2026-10-03T09:00', outAt: '', state: '挂起', holdReason: `批次 A-207 领用 50 kg 超过余量 42 kg，先挂起。` }),
   ]
 
   // ---------------- 出炉检验（2–3 条，含不合格与返工后复检合格） ----------------

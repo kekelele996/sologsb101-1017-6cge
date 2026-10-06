@@ -221,7 +221,7 @@ const defectRows = computed<Inspect[]>(() => rows.value.filter((row) => row.resu
         :suffix="`· ${DB_NAME}`"
         tone="info"
         icon="Histogram"
-        hint="IndexedDB 库名与结构版本；v2 为 Piece 增加 craft 索引并回填默认值"
+        hint="IndexedDB 库名与结构版本；v3 退火排位按批次与料液台账对账（挂起/待排/作废重排），v2 为 Piece 增加 craft 索引"
       />
     </div>
 

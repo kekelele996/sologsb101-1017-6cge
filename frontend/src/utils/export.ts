@@ -98,8 +98,12 @@ export function buildScheduleCsv(
     '已完成工序',
     '累计工时(分钟)',
     '退火记录数',
+    '对账批次',
+    '领用公斤(kg)',
+    '批次余量(kg)',
     '退火窑位',
     '退火状态',
+    '挂起/待排原因',
     '理论退火时长',
     '检验次数',
     '最近检验结果',
@@ -111,6 +115,7 @@ export function buildScheduleCsv(
     const pieceSteps = steps.filter((row) => row.pieceId === piece.id).sort((a, b) => a.seq - b.seq)
     const pieceAnneals = anneals.filter((row) => row.pieceId === piece.id)
     const latestAnneal = pieceAnneals.length > 0 ? pieceAnneals[pieceAnneals.length - 1] : null
+    const latestBatch = latestAnneal ? batches.find((row) => row.id === latestAnneal.batchId) : undefined
     const pieceInspects = inspects.filter((row) => row.pieceId === piece.id).sort((a, b) => a.date.localeCompare(b.date))
     const latestInspect = pieceInspects.length > 0 ? pieceInspects[pieceInspects.length - 1] : null
     lines.push(
@@ -127,8 +132,12 @@ export function buildScheduleCsv(
         pieceSteps.filter((row) => row.state === '已完成').length,
         Math.round(pieceSteps.reduce((acc, row) => acc + row.durationMin, 0) * 10) / 10,
         pieceAnneals.length,
+        latestBatch?.colorCode ?? '批次待核',
+        latestAnneal?.drawKg ?? '—',
+        latestBatch?.remainKg ?? '—',
         latestAnneal?.kilnSlot ?? '—',
         latestAnneal?.state ?? '—',
+        latestAnneal?.holdReason ?? '',
         formatHours(totalAnnealHours(piece.wallThicknessMm)),
         pieceInspects.length,
         latestInspect?.result ?? '—',
@@ -174,6 +183,7 @@ export function buildStepCardText(
   furnace: Furnace | undefined,
   steps: Step[],
   anneals: Anneal[],
+  batches: GlassBatch[] = [],
 ): string {
   const lines: string[] = []
   lines.push(`【工序卡片】${piece.name}（${piece.craft} · ${piece.artist} · ${piece.state}）`)
@@ -200,7 +210,10 @@ export function buildStepCardText(
   if (anneals.length > 0) {
     lines.push('退火：')
     anneals.forEach((row) => {
-      lines.push(`  ${row.kilnSlot} · ${row.curveSeg} · ${row.inAt} → ${row.outAt || '未出炉'} · ${row.state}`)
+      const drawBatch = batches.find((item) => item.id === row.batchId)
+      lines.push(
+        `  ${row.kilnSlot} · ${drawBatch?.colorCode ?? '批次待核'} 领用 ${row.drawKg} kg · ${row.curveSeg} · ${row.inAt} → ${row.outAt || '未出炉'} · ${row.state}${row.holdReason === '' ? '' : `（${row.holdReason}）`}`,
+      )
     })
   }
   return lines.join('\n')

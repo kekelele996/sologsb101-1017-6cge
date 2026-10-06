@@ -75,7 +75,7 @@ sologsb101-1017/
         ├── hooks/              # useStepProgress.ts useIdbTable.ts
         ├── pages/              # 5 个模块页面
         ├── router/index.ts     # 路由表 + ROUTES 常量
-        └── utils/              # thermal.ts db.ts export.ts seed.ts id.ts
+        └── utils/              # thermal.ts reconcile.ts db.ts export.ts seed.ts id.ts
 ```
 
 ---
@@ -87,7 +87,7 @@ sologsb101-1017/
 | `/furnaces` | `pages/FurnaceList.vue` | 窑炉与料液台账：新建/编辑/级联删除窑炉、登记料液批次、取料按剩余量扣减、低于阈值高亮提示补料 |
 | `/pieces` | `pages/PieceList.vue` | 作品登记与设计尺寸录入：按工艺与状态筛选、设计尺寸比例校验、显示工序完成度与当前道次 |
 | `/pieces/:id/steps` | `pages/StepDetail.vue` | 吹制工序逐道记录：拖拽排序、回填温度/时长/操作人、推进工序状态、前序未完成阻断进入退火排位 |
-| `/annealing` | `pages/AnnealingBoard.vue` | 退火窑位分配与曲线编排：窑位占用表、**窑位冲突时禁用提交**、状态流转、出炉回写作品状态 |
+| `/annealing` | `pages/AnnealingBoard.vue` | 退火窑位分配与曲线编排：排位前按批次对账（批次/领用量不符挂起不占窑位）、窑位冲突禁用提交、挂起重新对账/一键重排、状态流转、出炉回写作品状态 |
 | `/export` | `pages/ExportView.vue` | 出炉检验登记（不合格生成返工提示）+ JSON 结构版本查看与导入导出 + 窑务 CSV 汇总 |
 
 `/` 重定向到 `/furnaces`，未匹配路径统一回落到 `/furnaces`。
@@ -100,13 +100,16 @@ sologsb101-1017/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbglassblow`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`
   * `db.version(1)`：建立全部表与 `[pieceId+seq]` 复合索引；
   * `db.version(2)`：**为 `Piece` 增加 `craft` 索引并回填默认值**，同时补齐其余索引与字段：
     * `.upgrade()` 中逐行回填 `revision` / `createdAt` / `updatedAt`；
     * `pieces.craft` 缺失时回填 `吹制`，`pieces.state` 缺失时回填 `设计中`；
     * `steps.state` 缺失时按历史记录视为 `已完成`，避免升级后被误判为待办；
     * `anneals` 补齐 `outAt` 与 `curveSeg`，`inspects` 补齐 `defectNote`。
+  * `db.version(3)`：**熔化工段料液台账 ↔ 窑务退火排位两账按批次对账**：
+    * `anneals` 新增 `batchId`（加索引）、`drawKg`、`holdReason`；状态在 `待入窑/退火中/已出炉` 之外新增 `挂起/待排`；
+    * 老排位没记批次：`.upgrade()` 按作品挂的 `batchId` 回填，`drawKg` 回填 0；回填不出批次的未完成排位单列为 `挂起`（批次待核），不占窑位；已进窑 / 已出炉照原样保留。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
@@ -115,7 +118,7 @@ sologsb101-1017/
   | `batches` | id | furnaceId, colorCode, meltDate, remainKg |
   | `pieces` | id | batchId, state, artist, **craft**, name |
   | `steps` | id | pieceId, **[pieceId+seq]**, seq, state, name |
-  | `anneals` | id | pieceId, kilnSlot, state, inAt, curveSeg |
+  | `anneals` | id | pieceId, **batchId**, kilnSlot, state, inAt, curveSeg |
   | `inspects` | id | pieceId, date, result, inspector |
 
 * **首屏演示数据**：`initDatabase()` 在打开数据库后检测 `furnaces` 表是否为空，为空则调用 `utils/seed.ts` 播种，
@@ -124,6 +127,7 @@ sologsb101-1017/
   * 4 批料液（含 `A-207` 剩余 42 kg，故意低于 60 kg 补料阈值用于验证高亮与提醒）；
   * 5 件作品（覆盖四种状态与三种工艺）、17 道吹制工序（每件 2–5 道，seq 连续）；
   * 4 条退火记录（窑位 A1/A2/A3/B1 互不冲突，覆盖已出炉 / 退火中 / 待入窑）；
+  * 另含 1 条 `anneal-p1` 故意领用 50 kg 超过 A-207 余量 42 kg → **挂起不占窑位**，用于演示两账对账。
   * 3 条出炉检验（含一条「裂纹」不合格 + 一条返工后复检合格）。
   * 固定 id 如 `piece-morning-vase`、`piece-frost-bottle` 可直接用于深链验证。
 * **其他本地数据**：`localStorage` 仅保存「最近选中的作品 id」这一界面偏好，不存业务数据。
@@ -149,7 +153,24 @@ npm run preview      # 预览 dist 产物
 
 ---
 
-## 七、核心业务规则（`src/utils/thermal.ts`）
+## 七、核心业务规则（`src/utils/thermal.ts` / `src/utils/reconcile.ts`）
+
+### 两本台账按批次对账（`utils/reconcile.ts`）
+
+熔化工段料液台账记批次的**色号、配方、余量**，窑务退火账记**窑位与入窑排位**，两本各记各的。
+
+* **排位先对账**：窑务排位前先认「这件作品取料用的批次 `batchId` + 领用公斤数 `drawKg`」，两边按批次号对账。
+  * 批次对不上（排位认的批次 ≠ 作品挂的批次、批次已从台账删除、老账回填不出），或领用公斤数超过该批 `remainKg` → **这一炉先「挂起」，不占窑位**，保留意向窑位，等熔化工段确认。
+  * 对账通过且窑位时间窗不冲突 → 落为「待入窑」占窑位；窑位冲突仍禁止提交。
+* **补料 / 改配方不碰窑位**：熔化工段随时补料、改配方，不动窑务已排好的窑位（补料后由窑务在退火页「重新对账 / 一键重排」）。
+* **改某批领用公斤数 → 作废重排**（取料时触发，`db.consumeBatch` 单事务）：用到这批、**还没进窑**的排位全部作废，
+  * 先按最新余量重新对账，仍不过（如超量）→ 维持「挂起」；
+  * 对账通过 → **窑务自动找回空位**（原窑位优先，撞别人让到同窑 A1–C3 的下一个空位，绝不占别人窑位）；本窑窑位全满 → 撤回「待排」等空位；
+  * **已进窑（退火中）/ 已出炉的照当初领的量烧完**，批次与领用量快照冻结，不参与对账与重排。
+* **重排归属决策**：窑位问题由**窑务自动找回空位**，不退回熔化工段；只有批次 / 公斤数对不上才留在「挂起」池等熔化确认。两类异常在退火页分开列示（挂起 = 待熔化确认，待排 = 等空位）。
+* **老排位升级**：v3 升级时按作品挂的批次回填 `batchId`；回填不出来的单列为「挂起（批次待核）」。
+
+### 退火曲线与窑位（`utils/thermal.ts`）
 
 * **退火曲线时长换算**
   * 升温：20 ℃ → 560 ℃，按 120 ℃/h；
@@ -164,4 +185,4 @@ npm run preview      # 预览 dist 产物
 * **前序阻断**：任一前序工序未推进到「已完成」，`/pieces/:id/steps` 的「进入退火排位」会给出明确阻断原因。
 * **状态回写**：退火状态推进到「已出炉」即把作品状态回写为「已退火」；登记出炉检验后回写为「已检验」；
   判定不合格时生成返工提示，**原始工序记录完整保留**。
-* **料液扣减**：取料按剩余量扣减（不足时扣到 0），剩余量低于 60 kg 时列表行高亮并在顶部汇总提醒。
+* **料液扣减**：取料按剩余量扣减（不足时扣到 0），剩余量低于 60 kg 时列表行高亮并在顶部汇总提醒；取料（改某批领用公斤数）会在同一事务内把用到这批未进窑的排位作废重排（见上「两本台账按批次对账」）。

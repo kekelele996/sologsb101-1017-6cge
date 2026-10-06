@@ -14,15 +14,16 @@ import type { Anneal } from '../types/anneal'
 import type { Inspect } from '../types/inspect'
 import { nowIso } from './id'
 import { seedDatabase } from './seed'
+import { emptyRerankSummary, rerankAnneal, type RerankSummary } from './reconcile'
 
 /** 数据库名 */
 export const DB_NAME = 'gbglassblow'
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2
+export const DB_SCHEMA_VERSION = 3
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
 
 class GlassBlowDatabase extends Dexie {
   furnaces!: Table<Furnace, string>
@@ -93,6 +94,38 @@ class GlassBlowDatabase extends Dexie {
           if (typeof row.defectNote !== 'string') row.defectNote = ''
         })
       })
+
+    // ---------- v3：退火排位与料液台账按批次对账（补 batchId / drawKg / 挂起 / 待排） ----------
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        furnaces: 'id, code, type, state, fuelType, createdAt, updatedAt',
+        batches: 'id, furnaceId, colorCode, meltDate, remainKg',
+        pieces: 'id, batchId, state, artist, craft, name',
+        steps: 'id, pieceId, [pieceId+seq], seq, state, name',
+        // 新增 batchId 索引：改某批领用公斤数后可反查用到这批的排位
+        anneals: 'id, pieceId, batchId, kilnSlot, state, inAt, curveSeg',
+        inspects: 'id, pieceId, date, result, inspector',
+      })
+      .upgrade(async (tx) => {
+        // 老排位没记批次：按作品挂的批次回填；填不出来的单列为挂起（批次待核），不占窑位。
+        // 领用公斤数老账无据，回填 0 → 由对账判为「领用量未填」一并挂起，等熔化工段确认。
+        const pieceRows = (await tx.table('pieces').toCollection().toArray()) as Piece[]
+        const pieceById = new Map(pieceRows.map((row) => [row.id, row]))
+        await tx.table('anneals').toCollection().modify((row: Record<string, unknown>) => {
+          const state = typeof row.state === 'string' ? row.state : ''
+          if (typeof row.batchId !== 'string') {
+            const piece = pieceById.get(row.pieceId as string)
+            row.batchId = piece?.batchId ?? ''
+          }
+          if (typeof row.drawKg !== 'number' || Number.isNaN(row.drawKg)) row.drawKg = 0
+          if (typeof row.holdReason !== 'string') row.holdReason = ''
+          // 回填不出批次的未完成排位单列为挂起，绝不占窑位；已进窑 / 已出炉照原样保留
+          if (row.batchId === '' && state !== '退火中' && state !== '已出炉') {
+            row.state = '挂起'
+            row.holdReason = '老排位未记批次，按作品回填不出，需熔化工段确认批次。'
+          }
+        })
+      })
   }
 }
 
@@ -149,17 +182,103 @@ export async function putBatch(row: GlassBatch): Promise<void> {
   await db.batches.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION })
 }
 
+/**
+ * 删除料液批次：用到这批、未进窑的排位批次对不上 → 挂起不占窑位；
+ * 已进窑 / 已出炉的照当初快照保留。
+ */
 export async function removeBatch(id: string): Promise<void> {
-  await db.batches.delete(id)
+  await db.transaction('rw', db.batches, db.anneals, async () => {
+    const rows = await db.anneals.where('batchId').equals(id).toArray()
+    for (const row of rows) {
+      if (row.state === '待入窑' || row.state === '待排') {
+        await db.anneals.update(row.id, {
+          state: '挂起',
+          holdReason: '料液批次已从台账删除，批次对不上，先挂起。',
+          updatedAt: nowIso(),
+        })
+      }
+    }
+    await db.batches.delete(id)
+  })
 }
 
-/** 取料：按剩余量扣减（不足时扣到 0 并返回实际扣减量） */
-export async function consumeBatch(batchId: string, kg: number): Promise<number> {
-  const batch = await db.batches.get(batchId)
-  if (!batch) return 0
-  const actual = Math.max(0, Math.min(batch.remainKg, kg))
-  await db.batches.update(batchId, { remainKg: Math.round((batch.remainKg - actual) * 10) / 10, updatedAt: nowIso() })
-  return actual
+/**
+ * 取料（熔化工段改了某批的领用公斤数）：
+ * 1) 按剩余量扣减（不足时扣到 0 并返回实际扣减量）；
+ * 2) 用到这批、还没进窑的排位全部作废重排——先按最新余量重新对账，
+ *    通过则窑务自动找回空位（原窑位优先、撞别人让到同窑空位），窑位全满撤回待排；
+ *    仍对账不过（如超余量）维持挂起。已进窑 / 已出炉的照当初领的量烧完，绝不动。
+ */
+export async function consumeBatch(batchId: string, kg: number): Promise<{ actual: number; rerank: RerankSummary }> {
+  return db.transaction('rw', db.batches, db.pieces, db.anneals, async () => {
+    const batch = await db.batches.get(batchId)
+    if (!batch) return { actual: 0, rerank: emptyRerankSummary() }
+    const actual = Math.max(0, Math.min(batch.remainKg, kg))
+    await db.batches.update(batchId, { remainKg: Math.round((batch.remainKg - actual) * 10) / 10, updatedAt: nowIso() })
+
+    const [pieces, anneals, batches] = await Promise.all([
+      db.pieces.toArray(),
+      db.anneals.toArray(),
+      db.batches.toArray(),
+    ])
+    const thicknessOf = (pieceId: string): number =>
+      pieces.find((row) => row.id === pieceId)?.wallThicknessMm ?? 4
+
+    // 仅用到这批、且未进窑（待入窑 / 挂起 / 待排）的排位参与作废重排。
+    // 这些排位一开始就全部作废、释放窑位；随后逐条重排时用 effective 状态判冲突，
+    // 避免读到还没落库的旧「待入窑」状态而互相误判占窑。
+    const targets = anneals.filter((row) => row.batchId === batchId && ['待入窑', '挂起', '待排'].includes(row.state))
+    const effective = new Map<string, Anneal['state']>(anneals.map((row) => [row.id, row.state]))
+    targets.forEach((row) => {
+      // 先统一释放：待入窑的作废后不再占原窑位，挂起 / 待排本就不占
+      if (effective.get(row.id) === '待入窑') effective.set(row.id, '待排')
+    })
+    const liveAnneals = anneals.map((row) => ({ ...row, state: effective.get(row.id) ?? row.state }))
+    const summary = emptyRerankSummary()
+    summary.total = targets.length
+    const reasonPrefix = `熔化工段改了批次 ${batch.colorCode} 的领用公斤数；`
+
+    for (const row of targets) {
+      const current = { ...row, state: effective.get(row.id) ?? row.state }
+      const outcome = rerankAnneal(current, liveAnneals, pieces, batches, thicknessOf, reasonPrefix)
+      if (outcome.kind === 'place') {
+        await db.anneals.update(row.id, {
+          state: '待入窑',
+          kilnSlot: outcome.kilnSlot,
+          holdReason: '',
+          updatedAt: nowIso(),
+        })
+        effective.set(row.id, '待入窑')
+        const live = liveAnneals.find((item) => item.id === row.id)
+        if (live !== undefined) {
+          live.state = '待入窑'
+          live.kilnSlot = outcome.kilnSlot
+        }
+        summary.placed += 1
+      } else if (outcome.kind === 'queue') {
+        await db.anneals.update(row.id, {
+          state: '待排',
+          holdReason: outcome.reason,
+          updatedAt: nowIso(),
+        })
+        effective.set(row.id, '待排')
+        const live = liveAnneals.find((item) => item.id === row.id)
+        if (live !== undefined) live.state = '待排'
+        summary.queued += 1
+      } else {
+        await db.anneals.update(row.id, {
+          state: '挂起',
+          holdReason: outcome.reason,
+          updatedAt: nowIso(),
+        })
+        effective.set(row.id, '挂起')
+        const live = liveAnneals.find((item) => item.id === row.id)
+        if (live !== undefined) live.state = '挂起'
+        summary.held += 1
+      }
+    }
+    return { actual, rerank: summary }
+  })
 }
 
 /* -------------------------------- 作品 -------------------------------- */

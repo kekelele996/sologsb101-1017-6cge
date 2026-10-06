@@ -200,11 +200,15 @@ async function submitBatch(): Promise<void> {
 
 async function deleteBatch(row: GlassBatch): Promise<void> {
   try {
-    await ElMessageBox.confirm(`确认删除料液批次「${row.colorCode}」？`, '删除确认', {
-      type: 'warning',
-      confirmButtonText: '删除',
-      cancelButtonText: '取消',
-    })
+    await ElMessageBox.confirm(
+      `确认删除料液批次「${row.colorCode}」？用到这批、未进窑的退火排位会因批次对不上而挂起（不占窑位），已进窑的不受影响。`,
+      '删除确认',
+      {
+        type: 'warning',
+        confirmButtonText: '删除',
+        cancelButtonText: '取消',
+      },
+    )
   } catch {
     return
   }
@@ -222,9 +226,17 @@ async function submitConsume(): Promise<void> {
   const target = consumeTarget.value
   if (target === null) return
   const actual = await store.consume(target.id, consumeKg.value)
+  const rerank = store.lastRerank
   ElMessage.success(`已取料 ${actual} kg`)
   if (isLowRemain(target.remainKg - actual)) {
-    ElMessage.warning(`${target.colorCode} 剩余量低于 ${LOW_REMAIN_KG} kg，请及时补料`, )
+    ElMessage.warning(`${target.colorCode} 剩余量低于 ${LOW_REMAIN_KG} kg，请及时补料`)
+  }
+  if (rerank !== null && rerank.summary.total > 0) {
+    ElMessage({
+      type: 'info',
+      duration: 6000,
+      message: `用到 ${rerank.colorCode} 未进窑的排位已作废重排：落位 ${rerank.summary.placed}、挂起 ${rerank.summary.held}、待排 ${rerank.summary.queued}；已进窑的照原量烧完。`,
+    })
   }
   consumeDialog.value = false
 }
@@ -539,11 +551,19 @@ function handleFurnaceFilter(key: string, value: string): void {
       </template>
     </el-dialog>
 
-    <el-dialog v-model="consumeDialog" title="取料" width="460px">
+    <el-dialog v-model="consumeDialog" title="取料（改领用公斤数）" width="480px">
       <p class="dialog-tip">
         {{ consumeTarget?.colorCode }} 当前剩余
         <b>{{ consumeTarget?.remainKg }} kg</b>，取料后按剩余量扣减；不足时扣到 0。
       </p>
+      <el-alert
+        type="warning"
+        show-icon
+        :closable="false"
+        title="改这批的领用公斤数后，用到这批还没进窑的退火排位会作废重排"
+        description="窑务自动找回空位（原窑位优先、撞别人让到同窑空位），撞不上空位撤回待排，超余量则挂起；已进窑的照当初领的量烧完，不受影响。"
+        class="mb-14"
+      />
       <el-form label-width="110px">
         <el-form-item label="取料量（kg）">
           <el-input-number v-model="consumeKg" :min="0.5" :max="consumeTarget?.remainKg ?? 100" :step="0.5" style="width: 100%" />

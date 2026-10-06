@@ -10,19 +10,20 @@ import type { Furnace } from '../types/furnace'
 import type { GlassBatch } from '../types/batch'
 import type { Piece, PieceState } from '../types/piece'
 import type { Step } from '../types/step'
-import type { Anneal } from '../types/anneal'
+import type { Anneal, HoldState } from '../types/anneal'
 import type { Inspect } from '../types/inspect'
 import { nowIso } from './id'
+import { parseClaimedKg, planReschedule, occupiesSlot, type RescheduleSummary } from './reconcile'
 import { seedDatabase } from './seed'
 
 /** 数据库名 */
 export const DB_NAME = 'gbglassblow'
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2
+export const DB_SCHEMA_VERSION = 3
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2
+export const ROW_REVISION = 3
 
 class GlassBlowDatabase extends Dexie {
   furnaces!: Table<Furnace, string>
@@ -46,7 +47,7 @@ class GlassBlowDatabase extends Dexie {
     })
 
     // ---------- v2：Piece 增加 craft 索引并回填默认值，补齐其余索引与字段 ----------
-    this.version(DB_SCHEMA_VERSION)
+    this.version(2)
       .stores({
         furnaces: 'id, code, type, state, fuelType, createdAt, updatedAt',
         batches: 'id, furnaceId, colorCode, meltDate, remainKg',
@@ -93,6 +94,52 @@ class GlassBlowDatabase extends Dexie {
           if (typeof row.defectNote !== 'string') row.defectNote = ''
         })
       })
+
+    // ---------- v3：两本台账按批次对账，排位快照批次/领用公斤数，老排位回填 ----------
+    this.version(DB_SCHEMA_VERSION).stores({
+      furnaces: 'id, code, type, state, fuelType, createdAt, updatedAt',
+      batches: 'id, furnaceId, colorCode, meltDate, remainKg',
+      pieces: 'id, batchId, state, artist, craft, name',
+      steps: 'id, pieceId, [pieceId+seq], seq, state, name',
+      // holdState / batchId 为 v3 新增索引
+      anneals: 'id, pieceId, kilnSlot, state, inAt, curveSeg, holdState, batchId',
+      inspects: 'id, pieceId, date, result, inspector',
+    }).upgrade(async (tx) => {
+      const pieceRows = await tx.table('pieces').toCollection().toArray()
+      const stepRows = await tx.table('steps').toCollection().toArray()
+      const batchRows = await tx.table('batches').toCollection().toArray()
+      const batchIds = new Set(batchRows.map((row: { id?: unknown }) => row.id))
+      const pieceBatch = new Map<string, string>(
+        pieceRows.map((row: { id: string; batchId?: unknown }) => [row.id, typeof row.batchId === 'string' ? row.batchId : '']),
+      )
+
+      // 老排位没记批次：按作品挂的批次回填；领用公斤数从该作品「取料」工序备注解析；
+      // 批次填不出（作品批次为空 / 批次已不在台账）或领用公斤数解析不出 → legacyUnresolved 单列。
+      await tx.table('anneals').toCollection().modify((row: Record<string, unknown>) => {
+        const pieceId = typeof row.pieceId === 'string' ? row.pieceId : ''
+        const batchId = pieceBatch.get(pieceId) ?? ''
+        const feedStep = stepRows.find(
+          (step: { pieceId: string; name?: unknown; remark?: unknown }) =>
+            step.pieceId === pieceId && step.name === '取料' && typeof step.remark === 'string',
+        )
+        const claimedKg = parseClaimedKg(typeof feedStep?.remark === 'string' ? feedStep.remark : '')
+        const batchKnown = batchId !== '' && batchIds.has(batchId)
+
+        if (typeof row.batchId !== 'string') row.batchId = batchKnown ? batchId : ''
+        if (row.claimedKg === undefined) row.claimedKg = batchKnown ? claimedKg : null
+        if (typeof row.holdState !== 'string' || row.holdState === '') row.holdState = '正常'
+        if (typeof row.holdReason !== 'string') row.holdReason = ''
+        row.legacyUnresolved = !(batchKnown && claimedKg !== null)
+        row.revision = ROW_REVISION
+      })
+
+      // 其余表补齐行修订号
+      for (const table of [tx.table('furnaces'), tx.table('batches'), tx.table('pieces'), tx.table('steps'), tx.table('inspects')]) {
+        await table.toCollection().modify((row: Record<string, unknown>) => {
+          row.revision = ROW_REVISION
+        })
+      }
+    })
   }
 }
 
@@ -271,6 +318,146 @@ export async function advanceAnnealState(annealId: string, next: Anneal['state']
   await syncPieceState(row.pieceId)
 }
 
+/** 重排时需要的薄数据：退火窑号 + 各作品壁厚 */
+async function loadRescheduleContext(): Promise<{ kilnCodes: string[]; wallThicknessOf: (pieceId: string) => number }> {
+  const [furnaces, pieces] = await Promise.all([db.furnaces.toArray(), db.pieces.toArray()])
+  const kilnCodes = furnaces.filter((row) => row.type === '退火窑').map((row) => row.code).sort()
+  const thicknessMap = new Map(pieces.map((row) => [row.id, row.wallThicknessMm]))
+  return {
+    kilnCodes,
+    wallThicknessOf: (pieceId: string): number => thicknessMap.get(pieceId) ?? 4,
+  }
+}
+
+/** 把一批排位按「作废重排」规则落库（已进窑的排位不动） */
+async function applyReschedule(rows: Anneal[]): Promise<RescheduleSummary> {
+  if (rows.length === 0) return { invalidated: 0, resumed: 0, waiting: 0, held: 0, details: [] }
+  const [batches, allAnneals, { kilnCodes, wallThicknessOf }] = await Promise.all([
+    db.batches.toArray(),
+    db.anneals.toArray(),
+    loadRescheduleContext(),
+  ])
+
+  // 障碍只含正常且未出炉的排位；作废目标先整体撤出窑位（快照，不写库）再逐条抢占
+  const targets = new Set(rows.map((row) => row.id))
+  const staged: Anneal[] = allAnneals.filter((row) => !targets.has(row.id) && occupiesSlot(row))
+
+  // 入窑时间早的先挑空位，尽量贴近原排产顺序
+  const ordered = rows.slice().sort((a, b) => a.inAt.localeCompare(b.inAt))
+  const outcomes = ordered.map((row) =>
+    planReschedule({ row, batches, obstacles: staged, kilnCodes, wallThicknessOf }),
+  )
+
+  const stamp = nowIso()
+  await db.transaction('rw', db.anneals, async () => {
+    for (const outcome of outcomes) {
+      await db.anneals.update(outcome.annealId, {
+        holdState: outcome.holdState,
+        kilnSlot: outcome.kilnSlot,
+        holdReason: outcome.reason,
+        updatedAt: stamp,
+        revision: ROW_REVISION,
+      })
+      if (outcome.holdState === '正常') {
+        // 抢到空位的记录立刻成为后续排位的障碍
+        const source = ordered.find((row) => row.id === outcome.annealId)
+        if (source !== undefined) {
+          staged.push({ ...source, holdState: '正常', kilnSlot: outcome.kilnSlot })
+        }
+      }
+    }
+  })
+
+  return {
+    invalidated: rows.length,
+    resumed: outcomes.filter((row) => row.holdState === '正常').length,
+    waiting: outcomes.filter((row) => row.holdState === '待排').length,
+    held: outcomes.filter((row) => row.holdState === '挂起').length,
+    details: outcomes,
+  }
+}
+
+/**
+ * 重新排位：对「待排 / 挂起」的排位再跑一遍对账并由窑务自动找空位。
+ * 不传 annealId 时处理全部待排 / 挂起记录。
+ */
+export async function rescheduleAnneals(annealIds?: string[]): Promise<RescheduleSummary> {
+  const all = await db.anneals.toArray()
+  const pool = all.filter(
+    (row) => row.state === '待入窑' && (row.holdState === '待排' || row.holdState === '挂起'),
+  )
+  const rows = annealIds === undefined ? pool : pool.filter((row) => annealIds.includes(row.id))
+  return applyReschedule(rows)
+}
+
+/** 老排位回填确认：熔化工段补齐批次与领用公斤数后，按作废重排规则重新排位 */
+export async function resolveLegacyAnneal(
+  annealId: string,
+  patch: { batchId: string; claimedKg: number },
+): Promise<RescheduleSummary | null> {
+  const row = await db.anneals.get(annealId)
+  if (!row) return null
+  await db.anneals.update(annealId, {
+    batchId: patch.batchId,
+    claimedKg: patch.claimedKg,
+    legacyUnresolved: false,
+    holdState: '待排',
+    kilnSlot: '',
+    holdReason: '老排位已回填批次与领用公斤数，等待重新排位',
+    updatedAt: nowIso(),
+    revision: ROW_REVISION,
+  })
+  const refreshed = await db.anneals.get(annealId)
+  return refreshed ? applyReschedule([refreshed]) : null
+}
+
+/**
+ * 熔化工段更正某批「领用公斤数」（直接把台账余量改到目标值）。
+ * 用到这批且还没进窑（待入窑）的正常排位一律作废重排；
+ * 退火中 / 已出炉的排位照当初认领的量烧完，不动。
+ * 补料（余量增加）也走同一入口：无超量风险时作废排位会按原位重新落回。
+ */
+export async function correctBatchRemain(batchId: string, nextRemainKg: number): Promise<{
+  batch: GlassBatch
+  deltaKg: number
+  reschedule: RescheduleSummary
+}> {
+  const batch = await db.batches.get(batchId)
+  if (!batch) throw new Error('料液批次不存在')
+  const deltaKg = Math.round((nextRemainKg - batch.remainKg) * 10) / 10
+  await db.batches.update(batchId, { remainKg: nextRemainKg, updatedAt: nowIso() })
+
+  const affected = await db.anneals
+    .where('batchId')
+    .equals(batchId)
+    .filter((row) => row.state === '待入窑' && row.holdState === '正常')
+    .toArray()
+
+  // 先标记作废（待排不占窑位、不构成障碍）；原窑位保留在内存里供重排时优先回原位
+  if (affected.length > 0) {
+    const stamp = nowIso()
+    await db.anneals.bulkPut(
+      affected.map((row) => ({
+        ...row,
+        holdState: '待排' as HoldState,
+        kilnSlot: '',
+        holdReason: `熔化工段更正本批领用公斤数（余量变动 ${deltaKg > 0 ? '+' : ''}${deltaKg} kg），原排位作废重排`,
+        updatedAt: stamp,
+        revision: ROW_REVISION,
+      })),
+    )
+  }
+
+  // 内存行保留原窑位作为重排首选；applyReschedule 会按结果统一覆盖（落不到位则清空）
+  const refreshed = affected.map((row) => ({
+    ...row,
+    holdState: '待排' as HoldState,
+    holdReason: '',
+  }))
+  const summary = await applyReschedule(refreshed)
+  return { batch, deltaKg, reschedule: summary }
+}
+
 /* ------------------------------ 出炉检验 ------------------------------ */
 
 export async function listInspects(): Promise<Inspect[]> {
@@ -335,7 +522,18 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
     await db.batches.bulkPut(snapshot.batches.map((row) => ({ ...row, revision: ROW_REVISION })))
     await db.pieces.bulkPut(snapshot.pieces.map((row) => ({ ...row, revision: ROW_REVISION })))
     await db.steps.bulkPut(snapshot.steps.map((row) => ({ ...row, revision: ROW_REVISION })))
-    await db.anneals.bulkPut(snapshot.anneals.map((row) => ({ ...row, revision: ROW_REVISION })))
+    // 兼容旧版存档（v2 及以前的退火记录无对账字段）：缺失字段按待回填处理
+    await db.anneals.bulkPut(
+      snapshot.anneals.map((row) => ({
+        ...row,
+        batchId: typeof row.batchId === 'string' ? row.batchId : '',
+        claimedKg: typeof row.claimedKg === 'number' ? row.claimedKg : null,
+        holdState: row.holdState ?? '正常',
+        holdReason: row.holdReason ?? '',
+        legacyUnresolved: row.legacyUnresolved ?? typeof row.batchId !== 'string',
+        revision: ROW_REVISION,
+      })),
+    )
     await db.inspects.bulkPut(snapshot.inspects.map((row) => ({ ...row, revision: ROW_REVISION })))
   })
 }

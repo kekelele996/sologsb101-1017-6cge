@@ -11,6 +11,7 @@ import FilterBar from '@/components/common/FilterBar.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import StageTag from '@/components/common/StageTag.vue'
 import { useFurnaceStore } from '@/stores/furnaceStore'
+import { useAnnealStore } from '@/stores/annealStore'
 import {
   FUEL_TYPE_OPTIONS,
   FURNACE_STATE_OPTIONS,
@@ -26,16 +27,20 @@ import { LOW_REMAIN_KG, isLowRemain } from '@/utils/thermal'
 import { today } from '@/utils/id'
 
 const store = useFurnaceStore()
+const annealStore = useAnnealStore()
 
 const furnaceDialog = ref(false)
 const batchDialog = ref(false)
 const consumeDialog = ref(false)
+const correctDialog = ref(false)
 const submitting = ref(false)
 const editingFurnaceId = ref<string | null>(null)
 const editingBatchId = ref<string | null>(null)
 const consumeTarget = ref<GlassBatch | null>(null)
 const consumeKg = ref(5)
 const refillKg = ref(50)
+const correctTarget = ref<GlassBatch | null>(null)
+const correctedRemainKg = ref(0)
 const furnaceFormRef = ref<FormInstance>()
 const batchFormRef = ref<FormInstance>()
 const selectedFurnaceId = ref<string>('all')
@@ -94,7 +99,23 @@ const totals = computed(() => ({
 
 onMounted(() => {
   void store.loadAll()
+  void annealStore.loadAll()
 })
+
+/** 该批次挂起排位（批次对不上 / 领用超余量，等熔化确认） */
+function heldRowsOfBatch(batchId: string) {
+  return annealStore.anneals.filter((row) => row.batchId === batchId && row.holdState === '挂起')
+}
+
+/** 该批次待排排位（作废后等窑务找空位） */
+function waitingRowsOfBatch(batchId: string) {
+  return annealStore.anneals.filter((row) => row.batchId === batchId && row.holdState === '待排')
+}
+
+function pieceLabel(pieceId: string): string {
+  const piece = annealStore.pieces.find((row) => row.id === pieceId)
+  return piece === undefined ? '（作品已删除）' : piece.name
+}
 
 function openCreateFurnace(): void {
   editingFurnaceId.value = null
@@ -234,6 +255,34 @@ async function submitRefill(row: GlassBatch): Promise<void> {
   ElMessage.success(`已补料 ${refillKg.value} kg`)
 }
 
+function openCorrect(row: GlassBatch): void {
+  correctTarget.value = row
+  correctedRemainKg.value = row.remainKg
+  correctDialog.value = true
+}
+
+async function submitCorrect(): Promise<void> {
+  const target = correctTarget.value
+  if (target === null) return
+  const waiting = waitingRowsOfBatch(target.id).length
+  const affected =
+    annealStore.anneals.filter((item) => item.batchId === target.id && item.state === '待入窑' && item.holdState === '正常')
+      .length + waiting
+  try {
+    await ElMessageBox.confirm(
+      `更正「${target.colorCode}」领用公斤数（台账余量将改为 ${correctedRemainKg.value} kg）。` +
+        `用到这批还没进窑的 ${affected} 条排位会作废，由窑务重新找空位；已进窑的照原量烧完。`,
+      '领用公斤数更正确认',
+      { type: 'warning', confirmButtonText: '确认更正并重排', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  await store.correctClaim(target.id, correctedRemainKg.value)
+  ElMessage.success(store.lastMessage)
+  correctDialog.value = false
+}
+
 function batchRowClass({ row }: { row: GlassBatch }): string {
   return isLowRemain(row.remainKg) ? 'row-low-remain' : ''
 }
@@ -276,6 +325,32 @@ function handleFurnaceFilter(key: string, value: string): void {
           <div v-for="row in store.lowRemainBatches" :key="row.id">
             {{ row.colorCode }}（{{ furnaceLabel[row.furnaceId] ?? '未知窑炉' }}）剩余
             <b>{{ row.remainKg }} kg</b> —— {{ row.recipe }}
+          </div>
+        </div>
+      </template>
+    </el-alert>
+
+    <el-alert
+      v-if="annealStore.heldAnneals.length > 0 || annealStore.legacyAnneals.length > 0"
+      type="error"
+      show-icon
+      :closable="false"
+      class="mb-14"
+      :title="`有 ${annealStore.heldAnneals.length} 炉排位对账挂起（不占窑位），${annealStore.legacyAnneals.length} 条老排位待回填`"
+    >
+      <template #default>
+        <div class="low-list">
+          <div v-for="row in annealStore.heldAnneals" :key="row.id">
+            <router-link class="link-to-annealing" to="/annealing">
+              {{ pieceLabel(row.pieceId) }}
+            </router-link>
+            认领 {{ row.claimedKg ?? '—' }} kg ·
+            <b>{{ annealStore.colorCodeOf(row.batchId) }}</b>
+            —— {{ row.holdReason }}
+          </div>
+          <div v-for="row in annealStore.legacyAnneals" :key="`legacy-${row.id}`">
+            <router-link class="link-to-annealing" to="/annealing">{{ pieceLabel(row.pieceId) }}</router-link>
+            的老排位未记批次/领用公斤数，请在退火编排页回填
           </div>
         </div>
       </template>
@@ -419,6 +494,28 @@ function handleFurnaceFilter(key: string, value: string): void {
             </el-tag>
           </template>
         </el-table-column>
+        <el-table-column label="排位对账" width="170">
+          <template #default="{ row }">
+            <div class="cell-stack">
+              <el-tag
+                v-if="heldRowsOfBatch(row.id).length > 0"
+                type="danger"
+                size="small"
+              >
+                挂起 {{ heldRowsOfBatch(row.id).length }} 炉
+              </el-tag>
+              <el-tag
+                v-else-if="waitingRowsOfBatch(row.id).length > 0"
+                type="warning"
+                size="small"
+              >
+                待排 {{ waitingRowsOfBatch(row.id).length }} 炉
+              </el-tag>
+              <el-tag v-else type="success" size="small">排位正常</el-tag>
+              <span class="cell-sub">补料 / 改配方不影响已排窑位</span>
+            </div>
+          </template>
+        </el-table-column>
         <el-table-column label="取料 / 补料" width="300">
           <template #default="{ row }">
             <el-space>
@@ -428,9 +525,10 @@ function handleFurnaceFilter(key: string, value: string): void {
             </el-space>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="150" fixed="right">
+        <el-table-column label="操作" width="220" fixed="right">
           <template #default="{ row }">
             <el-button link type="primary" size="small" @click="openEditBatch(row)">编辑</el-button>
+            <el-button link type="warning" size="small" @click="openCorrect(row)">领用更正</el-button>
             <el-button link type="danger" size="small" @click="deleteBatch(row)">删除</el-button>
           </template>
         </el-table-column>
@@ -554,6 +652,24 @@ function handleFurnaceFilter(key: string, value: string): void {
         <el-button type="primary" @click="submitConsume">确认取料</el-button>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="correctDialog" title="领用公斤数更正（熔化工段）" width="520px">
+      <p class="dialog-tip">
+        {{ correctTarget?.colorCode }} 台账当前余量 <b>{{ correctTarget?.remainKg }} kg</b>。
+        熔化工段改了某批的领用公斤数时，在此把余量校正为实际值；
+        <b>用到这批还没进窑的排位自动作废，由窑务重新找空位</b>，已进窑的照当初认领的量烧完。
+        若只是补料或改配方，不必走此入口，已排窑位不受影响。
+      </p>
+      <el-form label-width="130px">
+        <el-form-item label="更正后余量（kg）">
+          <el-input-number v-model="correctedRemainKg" :min="0" :max="5000" :step="1" style="width: 100%" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="correctDialog = false">取消</el-button>
+        <el-button type="warning" :loading="submitting" @click="submitCorrect">确认更正并重排</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -612,6 +728,16 @@ function handleFurnaceFilter(key: string, value: string): void {
   margin: 0 0 12px;
   font-size: 13px;
   color: #5b6b7a;
+}
+
+.link-to-annealing {
+  color: #2f6fed;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.link-to-annealing:hover {
+  text-decoration: underline;
 }
 
 .mt-14 {

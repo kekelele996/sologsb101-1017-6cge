@@ -84,11 +84,11 @@ sologsb101-1017/
 
 | 路由 | 页面文件 | 功能 |
 | --- | --- | --- |
-| `/furnaces` | `pages/FurnaceList.vue` | 窑炉与料液台账：新建/编辑/级联删除窑炉、登记料液批次、取料按剩余量扣减、低于阈值高亮提示补料 |
+| `/furnaces` | `pages/FurnaceList.vue` | 窑炉与料液台账：新建/编辑/级联删除窑炉、登记料液批次、取料按剩余量扣减、低于阈值高亮提示补料、**领用公斤数更正触发未进窑排位作废重排**、挂起队列提醒 |
 | `/pieces` | `pages/PieceList.vue` | 作品登记与设计尺寸录入：按工艺与状态筛选、设计尺寸比例校验、显示工序完成度与当前道次 |
 | `/pieces/:id/steps` | `pages/StepDetail.vue` | 吹制工序逐道记录：拖拽排序、回填温度/时长/操作人、推进工序状态、前序未完成阻断进入退火排位 |
-| `/annealing` | `pages/AnnealingBoard.vue` | 退火窑位分配与曲线编排：窑位占用表、**窑位冲突时禁用提交**、状态流转、出炉回写作品状态 |
-| `/export` | `pages/ExportView.vue` | 出炉检验登记（不合格生成返工提示）+ JSON 结构版本查看与导入导出 + 窑务 CSV 汇总 |
+| `/annealing` | `pages/AnnealingBoard.vue` | 退火窑位分配与曲线编排：**排位前与料液台账按批次对账（批次/认领量快照）**、挂起/待排队列、老排位回填、窑位占用表、**窑位冲突时禁用提交**、状态流转、出炉回写作品状态 |
+| `/export` | `pages/ExportView.vue` | 出炉检验登记（不合格生成返工提示）+ JSON 结构版本查看与导入导出 + 窑务 CSV 汇总（含排位状态与认领公斤数） |
 
 `/` 重定向到 `/furnaces`，未匹配路径统一回落到 `/furnaces`。
 **层级路由支持直接深链**：把 `http://localhost:22817/pieces/piece-morning-vase/steps` 直接粘贴到地址栏即可打开；
@@ -100,13 +100,21 @@ sologsb101-1017/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbglassblow`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`
   * `db.version(1)`：建立全部表与 `[pieceId+seq]` 复合索引；
   * `db.version(2)`：**为 `Piece` 增加 `craft` 索引并回填默认值**，同时补齐其余索引与字段：
     * `.upgrade()` 中逐行回填 `revision` / `createdAt` / `updatedAt`；
     * `pieces.craft` 缺失时回填 `吹制`，`pieces.state` 缺失时回填 `设计中`；
     * `steps.state` 缺失时按历史记录视为 `已完成`，避免升级后被误判为待办；
     * `anneals` 补齐 `outAt` 与 `curveSeg`，`inspects` 补齐 `defectNote`。
+  * `db.version(3)`：**两本台账（料液台账 / 窑务排位）按批次对账**，为 `anneals` 增加
+    `batchId`、`claimedKg`、`holdState`、`holdReason`、`legacyUnresolved` 字段与
+    `holdState`、`batchId` 索引：
+    * 老排位没记批次：按作品挂的 `piece.batchId` 回填；认领公斤数从该作品「取料」工序
+      备注（如「取 G-101 料液约 6.2 kg」）解析；
+    * 批次填不出（作品批次为空 / 批次已不在台账）或认领公斤数解析不出 →
+      `legacyUnresolved = true`，在退火编排页与料液台账页**单列待人工回填确认**；
+    * 历史排位默认 `holdState = 正常`，不影响升级前已排好的窑位。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
@@ -115,7 +123,7 @@ sologsb101-1017/
   | `batches` | id | furnaceId, colorCode, meltDate, remainKg |
   | `pieces` | id | batchId, state, artist, **craft**, name |
   | `steps` | id | pieceId, **[pieceId+seq]**, seq, state, name |
-  | `anneals` | id | pieceId, kilnSlot, state, inAt, curveSeg |
+  | `anneals` | id | pieceId, kilnSlot, state, inAt, curveSeg, **holdState, batchId** |
   | `inspects` | id | pieceId, date, result, inspector |
 
 * **首屏演示数据**：`initDatabase()` 在打开数据库后检测 `furnaces` 表是否为空，为空则调用 `utils/seed.ts` 播种，
@@ -165,3 +173,19 @@ npm run preview      # 预览 dist 产物
 * **状态回写**：退火状态推进到「已出炉」即把作品状态回写为「已退火」；登记出炉检验后回写为「已检验」；
   判定不合格时生成返工提示，**原始工序记录完整保留**。
 * **料液扣减**：取料按剩余量扣减（不足时扣到 0），剩余量低于 60 kg 时列表行高亮并在顶部汇总提醒。
+* **两本台账按批次对账**（熔化工段料液台账 ↔ 窑务排位台账，核心规则在 `src/utils/reconcile.ts`）：
+  * **排位快照**：每条排位记下认账的 `batchId` 与 `claimedKg`（默认带作品挂的批次，领用公斤数
+    从「取料」工序备注预填，可改）；
+  * **排位前对账**：批次在料液台账中不存在（批次对不上），或认领公斤数超过
+    「批次余量 − 其他未出炉正常排位已认领量」（超余量），**这一炉挂起、不占窑位**，
+    退回熔化工段确认；对账通过且窑位时间窗不冲突才占窑位；
+  * **熔化侧动作边界**：补料、改配方只改批次本身，**不碰窑务已排好的窑位**；
+  * **领用公斤数更正**（料液台账页「领用更正」）：把某批余量校正为实际值后，
+    用到这批且**还没进窑（待入窑）的正常排位自动作废重排**；
+    **已进窑（退火中 / 已出炉）的排位照当初认领的量烧完**，不动；
+  * **作废重排策略（窑务找空位，不退回熔化工段）**：作废记录撤出窑位后由系统按入窑时间顺序
+    重新对账——对账通过则优先回原窑位、原位被占就自动扫下一个空窑位；撞上别人窑位且全场无空位
+    → 落「待排」队列（不占窑位）；对账不过 → 落「挂起」队列退回熔化工段确认。
+    退火编排页提供「重新排位」（单条 / 全部）入口；
+  * **老排位回填**：v3 升级时老排位没记批次，按作品挂的批次回填、认领量从取料备注解析；
+    填不出的在退火编排页「挂起 / 待排队列」中**单列**，点「回填确认」补齐后立即重排。

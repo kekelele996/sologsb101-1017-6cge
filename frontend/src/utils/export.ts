@@ -100,17 +100,21 @@ export function buildScheduleCsv(
     '退火记录数',
     '退火窑位',
     '退火状态',
+    '排位状态',
+    '认领料液(kg)',
     '理论退火时长',
     '检验次数',
     '最近检验结果',
   ]
   const lines: string[] = [header.map(csvCell).join(',')]
   pieces.forEach((piece) => {
-    const batch = batches.find((row) => row.id === piece.batchId)
-    const furnace = furnaces.find((row) => row.id === batch?.furnaceId)
-    const pieceSteps = steps.filter((row) => row.pieceId === piece.id).sort((a, b) => a.seq - b.seq)
+    const pieceBatch = batches.find((row) => row.id === piece.batchId)
     const pieceAnneals = anneals.filter((row) => row.pieceId === piece.id)
     const latestAnneal = pieceAnneals.length > 0 ? pieceAnneals[pieceAnneals.length - 1] : null
+    // 对账按排位快照批次（老排位未回填时回退到作品挂的批次）
+    const batch = batches.find((row) => row.id === latestAnneal?.batchId) ?? pieceBatch
+    const furnace = furnaces.find((row) => row.id === batch?.furnaceId)
+    const pieceSteps = steps.filter((row) => row.pieceId === piece.id).sort((a, b) => a.seq - b.seq)
     const pieceInspects = inspects.filter((row) => row.pieceId === piece.id).sort((a, b) => a.date.localeCompare(b.date))
     const latestInspect = pieceInspects.length > 0 ? pieceInspects[pieceInspects.length - 1] : null
     lines.push(
@@ -127,8 +131,10 @@ export function buildScheduleCsv(
         pieceSteps.filter((row) => row.state === '已完成').length,
         Math.round(pieceSteps.reduce((acc, row) => acc + row.durationMin, 0) * 10) / 10,
         pieceAnneals.length,
-        latestAnneal?.kilnSlot ?? '—',
+        latestAnneal?.kilnSlot || '不占窑位',
         latestAnneal?.state ?? '—',
+        latestAnneal?.legacyUnresolved ? '老排位待回填' : (latestAnneal?.holdState ?? '—'),
+        latestAnneal?.claimedKg ?? '—',
         formatHours(totalAnnealHours(piece.wallThicknessMm)),
         pieceInspects.length,
         latestInspect?.result ?? '—',
